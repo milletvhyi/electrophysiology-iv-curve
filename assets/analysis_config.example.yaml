@@ -1,0 +1,60 @@
+project:
+  name: "Example I-V experiment"
+  prefix: "EXAMPLE_IV"
+
+paths:
+  # Paths are resolved relative to this YAML file.
+  raw_data: "rawdata"
+  output: "analysis_workflow"
+
+# Each immediate child directory of raw_data is one cell/sample. Exactly one
+# folder_prefix must match each sample directory that contains ABF files.
+groups:
+  - folder_prefix: "con"
+    name: "Control"
+    role: "control"
+    color: "#111111"
+  - folder_prefix: "exp"
+    name: "Experimental"
+    role: "experimental"
+    color: "#E52521"
+
+files:
+  # Applied to both the ABF protocol name and its relative path.
+  include_regex: "(?i)(?:i[-_ ]?v|current[-_ ]?voltage|voltage[-_ ]?step)"
+  exclude_regex: null
+  accept_all_abf: false
+
+extraction:
+  channel: 0
+  command_threshold_mV: 0.5
+  min_step_duration_ms: 20.0
+  step_alignment_tolerance_ms: 1.0
+  baseline_window_ms: 10.0
+  steady_state_window_ms: 20.0
+  artifact_guard_ms: 2.0
+  voltage_round_decimals: 3
+
+analysis:
+  statistical_unit: "cell"
+  # raw_steady_state | baseline_subtracted | current_density_raw_steady_state |
+  # current_density_baseline_subtracted
+  current_measure: "raw_steady_state"
+
+  # Required only for a current_density_* measure. CSV must contain one unique,
+  # positive capacitance value for every included sample.
+  cell_metadata_csv: null
+  sample_column: "sample"
+  capacitance_column: "capacitance_pF"
+
+  pointwise_tests: true
+  # none | holm. Keep none unless correction was explicitly requested.
+  multiple_comparison_correction: "none"
+  max_exact_labelings: 100000
+  monte_carlo_permutations: 10000
+  random_seed: 20260820
+
+  normalization:
+    enabled: false
+    reference_voltage_mV: 100.0
+    minimum_denominator_abs: 1.0

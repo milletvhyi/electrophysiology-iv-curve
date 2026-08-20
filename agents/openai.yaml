@@ -1,0 +1,4 @@
+interface:
+  display_name: "Electrophysiology I-V Curve"
+  short_description: "Analyze ABF I-V curves with cell-level statistics"
+  default_prompt: "Use $electrophysiology-iv-curve to analyze my ABF voltage-step recordings and export a reproducible cell-level I-V curve report."

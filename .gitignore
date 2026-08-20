@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+analysis_workflow/
+.tmp-smoke-config.yaml
+.tmp-smoke-output/
+*.abf
+*.ABF
