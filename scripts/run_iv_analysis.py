@@ -28,7 +28,7 @@ import yaml
 from scipy import stats
 
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "1.1.0"
 CURRENT_MEASURES = {
     "raw_steady_state": ("steady_state_raw_pA", "pA", False),
     "baseline_subtracted": ("steady_state_baseline_subtracted_pA", "pA", False),
@@ -221,6 +221,32 @@ def load_and_validate_config(config_path: Path) -> tuple[dict[str, Any], dict[st
     if normalization_resolved["minimum_denominator_abs"] <= 0:
         raise ValueError("normalization.minimum_denominator_abs must be positive")
 
+    supplementary = analysis.get("supplementary_metrics", {})
+    if not isinstance(supplementary, dict):
+        raise ValueError("analysis.supplementary_metrics must be a mapping")
+    rectification_target = supplementary.get("rectification_target_mV", 80.0)
+    retention_target = supplementary.get("retention_target_mV")
+    supplementary_resolved = {
+        "enabled": bool(supplementary.get("enabled", True)),
+        "local_slope_points": int(supplementary.get("local_slope_points", 4)),
+        "rectification_target_mV": (
+            None if rectification_target is None else float(rectification_target)
+        ),
+        "retention_target_mV": (
+            None if retention_target is None else float(retention_target)
+        ),
+        "minimum_driving_force_mV": float(
+            supplementary.get("minimum_driving_force_mV", 5.0)
+        ),
+        "significance_alpha": float(supplementary.get("significance_alpha", 0.05)),
+    }
+    if supplementary_resolved["local_slope_points"] < 2:
+        raise ValueError("supplementary_metrics.local_slope_points must be at least 2")
+    if supplementary_resolved["minimum_driving_force_mV"] <= 0:
+        raise ValueError("supplementary_metrics.minimum_driving_force_mV must be positive")
+    if not 0 < supplementary_resolved["significance_alpha"] < 1:
+        raise ValueError("supplementary_metrics.significance_alpha must be between 0 and 1")
+
     metadata_path = None
     if analysis.get("cell_metadata_csv"):
         metadata_path = resolve_path(analysis["cell_metadata_csv"], config_path)
@@ -243,6 +269,7 @@ def load_and_validate_config(config_path: Path) -> tuple[dict[str, Any], dict[st
         "monte_carlo_permutations": monte_carlo,
         "random_seed": random_seed,
         "normalization": normalization_resolved,
+        "supplementary_metrics": supplementary_resolved,
     }
 
     resolved = copy.deepcopy(raw)
@@ -947,6 +974,182 @@ def normalize_cell_data(
     return result
 
 
+def estimate_reversal_potential(voltage: np.ndarray, current: np.ndarray) -> float:
+    """Linearly interpolate the best-supported zero-current crossing."""
+    order = np.argsort(voltage)
+    v = np.asarray(voltage, dtype=float)[order]
+    i = np.asarray(current, dtype=float)[order]
+    exact = np.where(np.isclose(i, 0.0, atol=1e-12))[0]
+    if len(exact):
+        return float(v[exact[np.argmin(np.abs(v[exact]))]])
+    crossings = np.where(i[:-1] * i[1:] < 0)[0]
+    if not len(crossings):
+        return np.nan
+    index = int(crossings[np.argmin(np.abs(i[crossings]) + np.abs(i[crossings + 1]))])
+    return float(v[index] - i[index] * (v[index + 1] - v[index]) / (i[index + 1] - i[index]))
+
+
+def resolve_symmetric_voltage(voltages: Iterable[float], target: float | None) -> float:
+    values = np.asarray(sorted(set(float(item) for item in voltages)), dtype=float)
+    positives = values[values > 0]
+    symmetric = [value for value in positives if np.any(np.isclose(values, -value))]
+    if not symmetric:
+        return np.nan
+    if target is None:
+        return float(max(symmetric))
+    return float(min(symmetric, key=lambda value: abs(value - abs(target))))
+
+
+def resolve_positive_voltage(voltages: Iterable[float], target: float | None) -> float:
+    positives = [float(item) for item in voltages if float(item) > 0]
+    if not positives:
+        return np.nan
+    if target is None:
+        return max(positives)
+    return min(positives, key=lambda value: abs(value - target))
+
+
+def build_supplementary_metrics(
+    cell_data: pd.DataFrame, settings: dict[str, Any]
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    voltages = sorted(cell_data["voltage_mV"].unique())
+    rectification_voltage = resolve_symmetric_voltage(
+        voltages, settings["rectification_target_mV"]
+    )
+    retention_voltage = resolve_positive_voltage(voltages, settings["retention_target_mV"])
+    rows: list[dict[str, Any]] = []
+    conductance_rows: list[dict[str, Any]] = []
+    endpoint_unit = str(cell_data["endpoint_unit"].iloc[0])
+    conductance_unit = "nS" if endpoint_unit == "pA" else f"{endpoint_unit}/mV"
+    for (sample, group), frame in cell_data.groupby(["sample", "group"], sort=True):
+        frame = frame.sort_values("voltage_mV")
+        v = frame["voltage_mV"].to_numpy(float)
+        current = frame["endpoint_value"].to_numpy(float)
+        reversal = estimate_reversal_potential(v, current)
+        slope = np.nan
+        slope_r2 = np.nan
+        if np.isfinite(reversal):
+            count = min(settings["local_slope_points"], len(v))
+            indices = np.argsort(np.abs(v - reversal))[:count]
+            if len(np.unique(v[indices])) >= 2:
+                fit = stats.linregress(v[indices], current[indices])
+                slope = float(fit.slope)
+                slope_r2 = float(fit.rvalue**2)
+        input_resistance = 1000.0 / slope if np.isfinite(slope) and abs(slope) > 1e-12 else np.nan
+
+        rectification = np.nan
+        if np.isfinite(rectification_voltage):
+            positive = frame.loc[np.isclose(frame["voltage_mV"], rectification_voltage), "endpoint_value"]
+            negative = frame.loc[np.isclose(frame["voltage_mV"], -rectification_voltage), "endpoint_value"]
+            if len(positive) == len(negative) == 1 and abs(float(negative.iloc[0])) > 1e-12:
+                rectification = float(positive.iloc[0] / abs(float(negative.iloc[0])))
+
+        retention = np.nan
+        if np.isfinite(retention_voltage):
+            selected = frame.loc[np.isclose(frame["voltage_mV"], retention_voltage)]
+            if len(selected) == 1:
+                peak = float(selected.iloc[0]["peak_raw_pA"])
+                steady = float(selected.iloc[0]["steady_state_raw_pA"])
+                if abs(peak) > 1e-12:
+                    retention = steady / peak
+
+        first = frame.iloc[0]
+        rows.append({
+            "sample": sample,
+            "group": group,
+            "role": first["role"],
+            "color": first["color"],
+            "reversal_potential_mV": reversal,
+            "local_slope_conductance_nS": slope if endpoint_unit == "pA" else np.nan,
+            "local_slope_fit_r_squared": slope_r2,
+            "apparent_input_resistance_MOhm": input_resistance if endpoint_unit == "pA" else np.nan,
+            "rectification_index": rectification,
+            "rectification_voltage_mV": rectification_voltage,
+            "current_retention_ratio": retention,
+            "retention_voltage_mV": retention_voltage,
+        })
+        if np.isfinite(reversal):
+            for voltage, value in zip(v, current):
+                driving_force = voltage - reversal
+                if abs(driving_force) < settings["minimum_driving_force_mV"]:
+                    continue
+                conductance_rows.append({
+                    "sample": sample,
+                    "group": group,
+                    "role": first["role"],
+                    "color": first["color"],
+                    "voltage_mV": voltage,
+                    "reversal_potential_mV": reversal,
+                    "driving_force_mV": driving_force,
+                    "apparent_chord_conductance": value / driving_force,
+                    "conductance_unit": conductance_unit,
+                    "analysis_role": "exploratory",
+                })
+    metadata = {
+        "analysis_role": "exploratory",
+        "rectification_voltage_mV": rectification_voltage,
+        "retention_voltage_mV": retention_voltage,
+        "conductance_unit": conductance_unit,
+        "minimum_driving_force_mV": settings["minimum_driving_force_mV"],
+    }
+    return pd.DataFrame(rows), pd.DataFrame(conductance_rows), metadata
+
+
+SUPPLEMENTARY_METRICS = [
+    ("reversal_potential_mV", "Reversal potential (mV)"),
+    ("local_slope_conductance_nS", "Local slope conductance (nS)"),
+    ("apparent_input_resistance_MOhm", "Apparent input resistance (MΩ)"),
+    ("rectification_index", "Rectification index"),
+    ("current_retention_ratio", "Current retention ratio"),
+]
+
+
+def run_metric_statistics(
+    metrics: pd.DataFrame, group_order: list[str], correction: str
+) -> pd.DataFrame:
+    if len(group_order) != 2 or metrics.empty:
+        return pd.DataFrame()
+    rows: list[dict[str, Any]] = []
+    for metric, label in SUPPLEMENTARY_METRICS:
+        a = (
+            metrics.loc[metrics["group"] == group_order[0], metric]
+            .dropna()
+            .to_numpy(float)
+        )
+        b = (
+            metrics.loc[metrics["group"] == group_order[1], metric]
+            .dropna()
+            .to_numpy(float)
+        )
+        row: dict[str, Any] = {
+            "metric": metric,
+            "label": label,
+            "group_1": group_order[0],
+            "group_2": group_order[1],
+        }
+        if len(a) >= 2 and len(b) >= 2:
+            row.update(welch_summary(a, b))
+            row["status"] = "performed"
+        else:
+            row.update(
+                {
+                    "n_group_1": len(a),
+                    "n_group_2": len(b),
+                    "status": "skipped",
+                    "reason": "At least two finite cells per group are required",
+                    "raw_p_value": np.nan,
+                }
+            )
+        rows.append(row)
+    result = pd.DataFrame(rows)
+    if correction == "holm":
+        mask = result["raw_p_value"].notna()
+        result.loc[mask, "holm_adjusted_p_value"] = holm_adjust(
+            result.loc[mask, "raw_p_value"]
+        )
+    return result
+
+
 def prepare_output(output: Path, resume: bool) -> dict[str, Path]:
     if output.exists() and any(output.iterdir()) and not resume:
         raise ValueError(
@@ -998,6 +1201,7 @@ def write_per_cell_workbook(
         raw.to_excel(writer, sheet_name="Raw_Traces", index=False)
         item["params"].to_excel(writer, sheet_name="IV_Params", index=False)
         metadata.to_excel(writer, sheet_name="Metadata", index=False)
+        format_excel_writer(writer)
 
 
 def build_trace_table(
@@ -1135,6 +1339,103 @@ def plot_iv_curve(
     return save_figure(figure, directory, stem)
 
 
+def plot_supplementary_metrics(
+    metrics: pd.DataFrame,
+    metric_stats: pd.DataFrame,
+    groups: list[dict[str, str]],
+    directory: Path,
+    prefix: str,
+    correction: str,
+) -> list[str]:
+    figure, axes = plt.subplots(2, 3, figsize=(10.2, 6.4))
+    rng = np.random.default_rng(20260820)
+    for axis, (metric, label) in zip(axes.ravel(), SUPPLEMENTARY_METRICS):
+        for index, group in enumerate(groups):
+            values = (
+                metrics.loc[metrics["group"] == group["name"], metric]
+                .dropna()
+                .to_numpy(float)
+            )
+            if not len(values):
+                continue
+            jitter = rng.uniform(-0.08, 0.08, len(values))
+            axis.scatter(
+                np.full(len(values), index) + jitter,
+                values,
+                s=20,
+                color=group["color"],
+                alpha=0.75,
+            )
+            mean = float(np.mean(values))
+            sem = float(stats.sem(values)) if len(values) > 1 else 0.0
+            axis.errorbar(
+                index,
+                mean,
+                yerr=sem,
+                fmt="o",
+                ms=6,
+                color=group["color"],
+                capsize=4,
+                lw=1.5,
+            )
+        axis.set_xticks(range(len(groups)), [item["name"] for item in groups], rotation=15)
+        axis.set_ylabel(label)
+        row = metric_stats.loc[metric_stats["metric"] == metric]
+        if not row.empty and row.iloc[0].get("status") == "performed":
+            test = row.iloc[0]
+            title = f"Welch raw p={test['raw_p_value']:.4g}"
+            if correction == "holm" and pd.notna(
+                test.get("holm_adjusted_p_value", np.nan)
+            ):
+                title += f"; Holm p={test['holm_adjusted_p_value']:.4g}"
+            axis.set_title(title, fontsize=9)
+        style_axis(axis)
+    axes.ravel()[-1].axis("off")
+    figure.suptitle("Exploratory cell-level I-V metrics")
+    figure.tight_layout()
+    return save_figure(figure, directory, f"{prefix}_IV_Supplementary_Metrics")
+
+
+def plot_conductance_curve(
+    conductance: pd.DataFrame,
+    groups: list[dict[str, str]],
+    directory: Path,
+    prefix: str,
+) -> list[str]:
+    if conductance.empty:
+        return []
+    figure, axis = plt.subplots(figsize=(7.0, 5.2))
+    for group in groups:
+        frame = conductance.loc[conductance["group"] == group["name"]]
+        for _, cell in frame.groupby("sample", sort=True):
+            axis.plot(cell["voltage_mV"], cell["apparent_chord_conductance"], color=group["color"], alpha=0.18, lw=0.8)
+        summary = frame.groupby("voltage_mV")["apparent_chord_conductance"].agg(["mean", "count", "sem"]).reset_index()
+        axis.errorbar(summary["voltage_mV"], summary["mean"], yerr=summary["sem"].fillna(0), color=group["color"], marker="o", ms=4, lw=1.8, capsize=2.5, label=f"{group['name']} (n={frame['sample'].nunique()})")
+    axis.axhline(0, color="#777777", lw=0.7)
+    axis.set_xlabel("Voltage (mV)")
+    axis.set_ylabel(f"Apparent chord conductance ({conductance['conductance_unit'].iloc[0]})")
+    axis.set_title("Exploratory apparent conductance-voltage relationship")
+    axis.legend(frameon=False)
+    style_axis(axis)
+    figure.tight_layout()
+    return save_figure(figure, directory, f"{prefix}_Apparent_Conductance_Curve")
+
+
+def format_excel_writer(writer: pd.ExcelWriter) -> None:
+    """Apply compact, auditable formatting without changing workbook values."""
+    from openpyxl.styles import Font, PatternFill
+    for worksheet in writer.book.worksheets:
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="1F4E78")
+        for column_cells in worksheet.columns:
+            letter = column_cells[0].column_letter
+            maximum = max((len(str(cell.value)) for cell in column_cells if cell.value is not None), default=8)
+            worksheet.column_dimensions[letter].width = min(max(maximum + 2, 10), 28)
+
+
 def json_clean(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): json_clean(item) for key, item in value.items()}
@@ -1189,10 +1490,13 @@ def build_report(
     global_result: dict[str, Any],
     pointwise: pd.DataFrame,
     normalized_result: dict[str, Any] | None,
+    metric_statistics: pd.DataFrame,
+    supplementary_metadata: dict[str, Any],
     output_files: list[str],
 ) -> str:
     analysis = runtime["analysis"]
     extraction = runtime["extraction"]
+    alpha = analysis["supplementary_metrics"]["significance_alpha"]
     lines = [
         f"# {runtime['project_name']} I-V Analysis Report",
         "",
@@ -1234,10 +1538,16 @@ def build_report(
         ]
     )
     if global_result.get("status") == "performed":
+        conclusion = (
+            "statistically significant"
+            if global_result["p_value"] < alpha
+            else "not statistically significant"
+        )
         lines.append(
             f"- Whole-curve {global_result['method']}: "
             f"p={global_result['p_value']:.6g}; "
-            f"evaluated={global_result['evaluated_labelings_or_permutations']}."
+            f"evaluated={global_result['evaluated_labelings_or_permutations']}. "
+            f"The whole-curve group comparison was {conclusion} at alpha={alpha:g}."
         )
     else:
         lines.append(f"- Whole-curve inference skipped: {global_result.get('reason')}.")
@@ -1246,6 +1556,31 @@ def build_report(
         lines.append(
             f"- Supplementary pointwise Welch tests: {len(pointwise)} voltages; "
             f"raw p values retained; multiple-comparison correction=`{correction}`."
+        )
+        p_column = (
+            "holm_adjusted_p_value"
+            if correction == "holm" and "holm_adjusted_p_value" in pointwise
+            else "raw_p_value"
+        )
+        significant = pointwise.loc[pointwise[p_column] < alpha]
+        minimum = pointwise.loc[pointwise[p_column].idxmin()]
+        lines.append(
+            f"- Pointwise result: {len(significant)}/{len(pointwise)} voltages were significant "
+            f"by `{p_column}` at alpha={alpha:g}; the smallest p value was "
+            f"{minimum[p_column]:.6g} at {minimum['voltage_mV']:g} mV."
+        )
+        positive_voltage = pointwise["voltage_mV"].max()
+        endpoint = pointwise.loc[np.isclose(pointwise["voltage_mV"], positive_voltage)].iloc[0]
+        endpoint_conclusion = "significant" if endpoint[p_column] < alpha else "not significant"
+        lines.append(
+            f"- At {positive_voltage:+g} mV, {endpoint['group_1']} was "
+            f"{endpoint['mean_group_1']:.3g} ± {endpoint['sem_group_1']:.3g} {global_result['endpoint_unit']} "
+            f"and {endpoint['group_2']} was {endpoint['mean_group_2']:.3g} ± "
+            f"{endpoint['sem_group_2']:.3g} {global_result['endpoint_unit']}; "
+            f"difference ({endpoint['group_1']}−{endpoint['group_2']}) "
+            f"{endpoint['mean_difference_group_1_minus_2']:.3g} {global_result['endpoint_unit']} "
+            f"(95% CI {endpoint['ci95_low']:.3g} to {endpoint['ci95_high']:.3g}), "
+            f"raw p={endpoint['raw_p_value']:.6g}, Hedges' g={endpoint['hedges_g']:.3g}; {endpoint_conclusion}."
         )
     else:
         lines.append("- Supplementary pointwise tests were not produced.")
@@ -1261,6 +1596,35 @@ def build_report(
             "- Exploratory per-cell normalized I-V: enabled; inference skipped: "
             f"{normalized_result.get('reason')}."
         )
+    if supplementary_metadata.get("enabled") and not metric_statistics.empty:
+        lines.extend(["", "### Exploratory cell-level metrics", ""])
+        lines.append(
+            f"Apparent conductance used each cell's interpolated reversal potential and excluded "
+            f"driving forces below {supplementary_metadata['minimum_driving_force_mV']:g} mV. "
+            "These conductance and derived resistance quantities are exploratory, not channel-specific."
+        )
+        for _, row in metric_statistics.iterrows():
+            if row.get("status") != "performed":
+                lines.append(f"- {row['label']}: inference skipped ({row.get('reason')}).")
+                continue
+            correction = analysis["multiple_comparison_correction"]
+            adjusted_p = row.get("holm_adjusted_p_value", np.nan)
+            use_holm = correction == "holm" and pd.notna(adjusted_p)
+            p_value = adjusted_p if use_holm else row["raw_p_value"]
+            significance = "significant" if p_value < alpha else "not significant"
+            p_text = f"Welch raw p={row['raw_p_value']:.6g}"
+            significance_basis = "raw p value"
+            if use_holm:
+                p_text += f", Holm-adjusted p={adjusted_p:.6g}"
+                significance_basis = "Holm-adjusted p value"
+            lines.append(
+                f"- {row['label']}: {row['group_1']} {row['mean_group_1']:.3g} ± {row['sem_group_1']:.3g} "
+                f"vs {row['group_2']} {row['mean_group_2']:.3g} ± {row['sem_group_2']:.3g}; "
+                f"difference {row['mean_difference_group_1_minus_2']:.3g} "
+                f"(95% CI {row['ci95_low']:.3g} to {row['ci95_high']:.3g}), "
+                f"{p_text}, Hedges' g={row['hedges_g']:.3g}; {significance} "
+                f"by the {significance_basis} at alpha={alpha:g}."
+            )
     lines.extend(
         [
             "",
@@ -1449,6 +1813,43 @@ def run(config_path: Path, inventory_only: bool, resume: bool) -> int:
             f"{prefix}_Normalized_IV_Curve",
         )
 
+    supplementary_metrics = pd.DataFrame()
+    conductance_data = pd.DataFrame()
+    metric_statistics = pd.DataFrame()
+    supplementary_metadata: dict[str, Any] = {"enabled": False}
+    supplementary_paths: list[str] = []
+    supplementary = runtime["analysis"]["supplementary_metrics"]
+    if supplementary["enabled"]:
+        supplementary_metrics, conductance_data, supplementary_metadata = (
+            build_supplementary_metrics(cell_data, supplementary)
+        )
+        correction = runtime["analysis"]["multiple_comparison_correction"]
+        metric_statistics = run_metric_statistics(
+            supplementary_metrics, group_order, correction
+        )
+        supplementary_paths.extend(
+            plot_supplementary_metrics(
+                supplementary_metrics,
+                metric_statistics,
+                runtime["groups"],
+                directories["figures"],
+                prefix,
+                correction,
+            )
+        )
+        supplementary_paths.extend(
+            plot_conductance_curve(
+                conductance_data, runtime["groups"], directories["figures"], prefix
+            )
+        )
+        supplementary_metadata["enabled"] = True
+
+    supplementary_csv = directories["extracted"] / f"{prefix}_IV_Supplementary_Metrics.csv"
+    conductance_csv = directories["extracted"] / f"{prefix}_IV_Apparent_Conductance.csv"
+    if supplementary["enabled"]:
+        supplementary_metrics.to_csv(supplementary_csv, index=False, encoding="utf-8-sig")
+        conductance_data.to_csv(conductance_csv, index=False, encoding="utf-8-sig")
+
     figure_data_path = directories["figures"] / f"{prefix}_IV_Figure_Data.xlsx"
     with pd.ExcelWriter(figure_data_path, engine="openpyxl") as writer:
         cell_data.to_excel(writer, sheet_name="Main_Cell_Data", index=False)
@@ -1459,6 +1860,10 @@ def run(config_path: Path, inventory_only: bool, resume: bool) -> int:
             normalized_summary.to_excel(
                 writer, sheet_name="Normalized_Summary", index=False
             )
+        if not supplementary_metrics.empty:
+            supplementary_metrics.to_excel(writer, sheet_name="Supplementary_Metrics", index=False)
+            conductance_data.to_excel(writer, sheet_name="Apparent_Conductance", index=False)
+        format_excel_writer(writer)
 
     statistics_path = directories["statistics"] / f"{prefix}_IV_Statistics.xlsx"
     with pd.ExcelWriter(statistics_path, engine="openpyxl") as writer:
@@ -1477,6 +1882,10 @@ def run(config_path: Path, inventory_only: bool, resume: bool) -> int:
             normalized_pointwise.to_excel(
                 writer, sheet_name="Norm_Pointwise", index=False
             )
+        if not supplementary_metrics.empty:
+            supplementary_metrics.to_excel(writer, sheet_name="Supplementary_Metrics", index=False)
+            metric_statistics.to_excel(writer, sheet_name="Supplementary_Tests", index=False)
+        format_excel_writer(writer)
 
     results = {
         "script_version": SCRIPT_VERSION,
@@ -1499,6 +1908,10 @@ def run(config_path: Path, inventory_only: bool, resume: bool) -> int:
             "analysis_role": "exploratory" if normalization["enabled"] else None,
             "global_test": normalized_result,
         },
+        "supplementary_metrics": {
+            **supplementary_metadata,
+            "statistics": metric_statistics.to_dict(orient="records"),
+        },
         "trace_panels": "group means calculated from every included cell",
     }
     results_path = directories["statistics"] / f"{prefix}_IV_Results.json"
@@ -1512,7 +1925,8 @@ def run(config_path: Path, inventory_only: bool, resume: bool) -> int:
         figure_data_path,
         statistics_path,
         results_path,
-        *[Path(item) for item in trace_paths + curve_paths + normalized_paths],
+        *([supplementary_csv, conductance_csv] if supplementary["enabled"] else []),
+        *[Path(item) for item in trace_paths + curve_paths + normalized_paths + supplementary_paths],
     ]
     report_text = build_report(
         runtime,
@@ -1523,6 +1937,8 @@ def run(config_path: Path, inventory_only: bool, resume: bool) -> int:
         global_result,
         pointwise,
         normalized_result,
+        metric_statistics,
+        supplementary_metadata,
         [path.relative_to(directories["root"]).as_posix() for path in deliverable_paths],
     )
     report_path.write_text(report_text, encoding="utf-8")

@@ -50,6 +50,11 @@ tables.
 - Treat the raw/current-density I-V curve as primary. Enable per-cell normalization
   only as an explicitly labeled exploratory analysis; it does not replace the
   primary curve.
+- When enabled, export exploratory reversal potential, local slope conductance,
+  apparent input resistance, rectification, current retention, and an apparent
+  conductance-voltage curve. Resolve targets from the observed voltage set; never
+  assume 21 sweeps or a fixed -100 to +100 mV protocol. Label apparent conductance
+  as non-channel-specific.
 - With two adequately replicated groups, compare whole cell profiles by relabeling
   intact cell curves. Pointwise Welch tests are supplementary and report raw p
   values by default. Apply Holm correction only when explicitly configured.
@@ -63,5 +68,7 @@ tables.
 State the source and output directories, config path, included/excluded ABFs, cell
 counts, voltage range, endpoint windows, current mode and units, group order, global
 test method, pointwise correction policy, normalization status, and any validation
-failure or manual exclusion. Distinguish successful local execution from biological
-or experimental validation.
+failure or manual exclusion. For every performed comparison, state its exact p
+value and whether it meets the configured alpha; include group means, confidence
+intervals, and effect size when available. Distinguish successful local execution
+from biological or experimental validation.

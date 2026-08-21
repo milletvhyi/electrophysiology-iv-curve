@@ -45,6 +45,22 @@ class StepDetectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not aligned"):
             iv.detect_step_window(command, 1000, self.settings())
 
+    def test_detection_adapts_to_different_sampling_rate_length_and_sweep_count(self):
+        settings = self.settings()
+        settings["baseline_window_ms"] = 8.0
+        settings["steady_state_window_ms"] = 12.0
+        command = np.full((7, 1375), -65.0)
+        levels = [-120, -80, -40, 0, 40, 80, 120]
+        for index, level in enumerate(levels):
+            command[index, 213:1013] = level
+
+        result = iv.detect_step_window(command, 5000, settings)
+
+        self.assertEqual(result["start_index"], 213)
+        self.assertEqual(result["end_index"], 1013)
+        self.assertEqual(result["baseline_samples"], 40)
+        self.assertEqual(result["steady_samples"], 60)
+
 
 class StatisticsTests(unittest.TestCase):
     def test_exact_curve_permutation_preserves_cell_profiles(self):
@@ -123,6 +139,59 @@ class CellAggregationTests(unittest.TestCase):
         data.loc[data["sample"] == "c2", "endpoint_value"] = [4.0, 0.1]
         with self.assertRaisesRegex(ValueError, "denominators"):
             iv.normalize_cell_data(data, 100.0, 1.0)
+
+    def test_supplementary_metrics_adapt_to_nonstandard_voltage_grid(self):
+        rows = []
+        voltages = [-120.0, -80.0, -40.0, 0.0, 40.0, 80.0]
+        for sample, group in [("a1", "A"), ("a2", "A"), ("b1", "B"), ("b2", "B")]:
+            for voltage in voltages:
+                current = 10.0 * (voltage + 30.0)
+                rows.append({
+                    "sample": sample, "group": group,
+                    "role": "control" if group == "A" else "experimental",
+                    "color": "#111111" if group == "A" else "#E52521",
+                    "voltage_mV": voltage, "endpoint_value": current,
+                    "endpoint_unit": "pA", "steady_state_raw_pA": current,
+                    "peak_raw_pA": current / 0.8,
+                })
+        settings = {
+            "local_slope_points": 3,
+            "rectification_target_mV": 100.0,
+            "retention_target_mV": None,
+            "minimum_driving_force_mV": 5.0,
+        }
+
+        metrics, conductance, metadata = iv.build_supplementary_metrics(pd.DataFrame(rows), settings)
+
+        np.testing.assert_allclose(metrics["reversal_potential_mV"], -30.0)
+        np.testing.assert_allclose(metrics["local_slope_conductance_nS"], 10.0)
+        np.testing.assert_allclose(metrics["current_retention_ratio"], 0.8)
+        self.assertEqual(metadata["rectification_voltage_mV"], 80.0)
+        np.testing.assert_allclose(conductance["apparent_chord_conductance"], 10.0)
+
+    def test_supplementary_metric_statistics_keep_raw_and_holm_p_values(self):
+        rows = []
+        for sample, group, offset in [
+            ("a1", "A", 0.0),
+            ("a2", "A", 0.2),
+            ("a3", "A", -0.1),
+            ("b1", "B", 2.0),
+            ("b2", "B", 2.2),
+            ("b3", "B", 1.9),
+        ]:
+            row = {"sample": sample, "group": group}
+            for index, (metric, _) in enumerate(iv.SUPPLEMENTARY_METRICS):
+                row[metric] = float(index) + offset
+            rows.append(row)
+
+        result = iv.run_metric_statistics(pd.DataFrame(rows), ["A", "B"], "holm")
+
+        self.assertEqual(len(result), len(iv.SUPPLEMENTARY_METRICS))
+        self.assertTrue(result["raw_p_value"].notna().all())
+        self.assertTrue(result["holm_adjusted_p_value"].notna().all())
+        self.assertTrue(
+            (result["holm_adjusted_p_value"] >= result["raw_p_value"]).all()
+        )
 
 
 class RoutingTests(unittest.TestCase):
