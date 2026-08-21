@@ -9,6 +9,11 @@ cells, and exports figures, CSV/Excel tables, JSON provenance, and a bounded Mar
 report. Two-group inference permutes intact cell curves; pointwise tests retain raw p
 values by default.
 
+Optional exploratory outputs include reversal potential, local slope conductance,
+apparent input resistance, rectification, current retention, and an apparent
+conductance-voltage curve. Voltage targets are resolved from the recorded voltage
+set, so these outputs do not assume a fixed sweep count or -100 to +100 mV protocol.
+
 ## Install as a Codex skill
 
 ```powershell
@@ -40,6 +45,17 @@ exactly one intended I-V ABF. One-group datasets receive descriptive exports; ex
 two groups with adequate replication also receive a whole-curve permutation test and
 supplementary pointwise Welch tests.
 
+## Adaptive behavior and boundaries
+
+The analysis detects the command-step window from each recording and supports
+different sweep counts, sampling rates, trace lengths, voltage counts, voltage
+spacings, and step timings across separate experiments. Rectification and retention
+targets resolve to compatible voltages present in the current dataset.
+
+Within one comparative run, cells must still share a common voltage set and time
+base. Incompatible cells fail with an explicit error instead of being silently
+interpolated or discarded. Full-resolution per-cell traces are always retained.
+
 ## Scientific defaults
 
 - cells, never sweeps, are independent statistical units;
@@ -47,6 +63,7 @@ supplementary pointwise Welch tests.
 - raw signed steady-state current in pA is the default endpoint;
 - current density requires supplied capacitance for every cell;
 - normalized I-V is optional and explicitly exploratory;
+- conductance-derived metrics are exploratory and not channel-specific;
 - pointwise p values are unadjusted unless Holm correction is explicitly configured;
 - unsupported biological, animal-count, and mechanism claims are omitted.
 
@@ -68,7 +85,8 @@ experimental quality control, or biological interpretation.
 该 skill 将 ABF 电压阶跃记录整理为可审计的细胞级 I-V 曲线。默认不把 sweep
 当作独立样本，不自动做 Holm 校正，不把标准化 I-V 当成主分析，也不会根据文件
 大小猜测协议。正式运行前请先执行 `--inventory-only`，核对入选文件、分组和电压
-阶跃窗口。
+阶跃窗口。可选输出包括反转电位、局部斜率电导、表观输入电阻、整流指数、电流
+保留率及表观电导曲线；这些补充指标会明确标注为探索性结果。
 
 ## License
 

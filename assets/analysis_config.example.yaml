@@ -54,6 +54,14 @@ analysis:
   monte_carlo_permutations: 10000
   random_seed: 20260820
 
+  supplementary_metrics:
+    enabled: true
+    local_slope_points: 4
+    rectification_target_mV: 80.0
+    retention_target_mV: null
+    minimum_driving_force_mV: 5.0
+    significance_alpha: 0.05
+
   normalization:
     enabled: false
     reference_voltage_mV: 100.0

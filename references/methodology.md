@@ -84,6 +84,24 @@ Per-cell normalization divides the selected endpoint by the same cell's value at
 configured reference voltage. It is off by default, requires a non-negligible
 denominator for every cell, and is labeled exploratory in every output.
 
+## Exploratory cell-level metrics
+
+When enabled, reversal potential is linearly interpolated at the best-supported
+zero-current crossing in each cell. Local slope conductance is fitted from the
+configured number of voltage points nearest that crossing; 1 pA/mV is reported as
+1 nS. Apparent input resistance is 1000 divided by this slope and is omitted for
+current-density endpoints. Rectification uses an observed symmetric voltage pair
+nearest the configured target. Current retention uses the raw signed steady-state
+to peak ratio at the selected positive voltage, defaulting to the largest positive
+voltage recorded.
+
+The apparent chord-conductance curve divides selected current by `V - Erev` and
+omits points within the configured minimum driving force. It is an exploratory
+algebraic transform, not evidence for channel identity or a valid single-channel
+conductance model. These rules adapt to voltage count, spacing, sampling rate,
+trace length, and detected step timing. A common voltage set remains required
+within one group comparison so whole-cell profiles are comparable.
+
 ## Interpretation boundaries
 
 An ABF-derived curve establishes the recorded current-voltage relationship under the
